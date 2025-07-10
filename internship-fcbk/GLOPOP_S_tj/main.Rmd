@@ -1,0 +1,1282 @@
+---
+title: "Ordinal Multi-class Classification Problem on Harward GLOPOP Data"
+description: |
+  1. Choosing a model out of these four: Ordinal Logistic Regression, Light GBM, Satboost, General Ordinal Logistic Regression
+  2. A model's assumptions test.
+  3. Feature Modification and Selection.
+  4. Multivariate Modelling.
+  5. Performance Evaluation on various metrics.
+author: "Shahnoza Nurubloeva"
+date: "`r format(Sys.Date(), '%d-%m-%Y')`"
+date_start: "1 July 2025"
+params:
+  change_group_names: FALSE
+  modelType: 3
+  hyperparams_tuning: FALSE
+always_allow_html: true
+output:
+  rmdformats::readthedown:
+    code_folding: hide
+    code_download: yes
+    number_sections: yes
+    highlight: pygments
+    toc_depth: 1
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+    self_contained: yes
+    lightbox: yes
+    thumbnails: yes
+    gallery: no
+    css: styles.css
+# output:
+#   rmdformats::readthedown:
+#     code_folding: hide
+#     code_download: yes
+#     css: styles.css   
+---
+
+> Set the parameter as follows for the correct choice of the model:
+>
+> - params$modelType = 0 -> Ordinal Logistic Regression MASS::polr()
+> - params$modelType = 1 -> LightGBM
+> - params$modelType = 2 -> CatBoost
+> - params$modelType = 3 -> Generalized Logistic Regression VGAM::vglm()
+
+# Data Load & Prepare & Analyse
+
+The data was obtained from global synthetic population database [GLOPOP-S](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/KJC3RH). They took the Demographic and Health Surveys for 45 countries including Tajikistan, categorized and harmonized it, as well as went through other data processing steps including creating regional marginal distributions. 
+
+
+In case of missing data in the regions, to fill it in, new data was modeled based on _k_ number of regions with similar subnational human develepment index (SHDI) or SHDI relative to national HDI. 
+
+
+Then, marginals were scaled to match the region’s population size in 2015  to conserve the shape of the marginal distributions.
+
+
+The following methods were used to generate a synthetic population from DHS and LIS: synthetic reconstruction, combinatorial optimization, statistical learning.
+
+
+All the columns of the data, although represented as numbers, are of categorical type. Below is the description of the columns taken from the article ["A global dataset of 7 billion individuals with socio-economic characteristics"](https://www.nature.com/articles/s41597-024-03864-2) Nature journal.
+
+![Relative](data\\column_description_table.png){height=95%, width=95%}
+
+```{r Load required packages, message=FALSE}
+
+library(dplyr)
+library(R.utils)
+library(Rcpp)
+library(MASS)
+library(purrr)
+library(tidyr)
+library(pROC)
+library(ROCR)
+library(caret)
+library(DescTools)
+library(lightgbm)
+library(mlr3)
+library(mlr3tuning)
+library(paradox)
+library(EIX)
+library(catboost)
+library(Information)
+library(polycor)
+library(brant)
+library(gt)
+library(car)
+library(VGAM)
+library(forcats)
+library(FSelector)
+library(gt)
+
+
+```
+
+```{r Load and Process Data, include=FALSE}
+
+filename_indi <- paste0('C:\\Users\\SNurubloeva\\Documents\\Projects\\GLOPOP_S_tj\\data\\Nr_individuals_data_availability.csv')
+
+individuals_per_region <- read.csv(filename_indi, sep = ',', header = TRUE) 
+n_columns = 15
+
+DF <- data.frame()
+
+
+
+### all 5 regions of Tj
+
+gdlcodes <- c('TJKr101', 'TJKr102', 'TJKr103', 'TJKr104', 'TJKr105')
+for(i in 1:5){
+  filename <- paste0('C:\\Users\\SNurubloeva\\Documents\\Projects\\GLOPOP_S_tj\\data\\synthpop_', gdlcodes[i], '.dat.gz')
+  l = individuals_per_region[individuals_per_region$GDLcode == gdlcodes[i],]$Nr_individuals
+
+  # con <- cbind(gzcon(file(filename, "rb")))
+  con <- gzcon(file(filename, "rb"))
+
+  regionalDF <- readBin(con, integer(), n = l*n_columns)
+
+  close(con)
+
+  regionalDF <- array(regionalDF, dim=c(l, n_columns))
+  regionalDF <- as.data.frame(regionalDF)
+  regionalDF$REGION <- i
+
+  DF <- rbind(DF, regionalDF)
+
+  }
+
+
+### one region of Tj
+
+# i=1
+# filename <- paste0('C:\\Users\\SNurubloeva\\Documents\\Projects\\GLOPOP_S_tj\\data\\synthpop_', gdlcodes[i], '.dat.gz')
+# l = individuals_per_region[individuals_per_region$GDLcode == gdlcodes[i],]$Nr_individuals
+# 
+# # con <- cbind(gzcon(file(filename, "rb")))
+# con <- gzcon(file(filename, "rb"))
+# 
+# DF = readBin(con, integer(), n = l*n_columns)
+# 
+# close(con)
+# 
+# DF <- array(DF, dim=c(l, n_columns))
+# DF <- as.data.frame(DF)
+# DF$REGION <- i
+
+
+ 
+colnames(DF) <- c('HID', 'RELATE_HEAD', 'INCOME', 'WEALTH', 'RURAL', 'AGE', 'GENDER',
+                         'EDUC', 'HHTYPE', 'HHSIZE_CAT','AGRI_OWNERSHIP', 'FLOOR', 'WALL', 'ROOF', 'SOURCE', 'REGION')
+
+```
+
+```{r Split Data, echo = FALSE}
+
+DF <- DF[sample(nrow(DF)), ]
+# DF <- DF[1:500000, ]
+train <- 1:(round(0.7*nrow(DF))-1)
+# train <- 1:100
+test <- round(0.7*nrow(DF)):nrow(DF)
+# train <- DF[1:t, ]
+# test <- DF[t:nrow(DF), ]
+
+
+```
+
+## Exploratory Data Analysis
+___General Observations___
+
+  - The dataset contains **9,269,799 records** with **16 variables**, all of which are categorical (encoded as integers).  
+
+  - **No missing values** are present in any column (`Miss = 0` for all variables).  
+
+---
+
+___Key Variable Insights___
+
+**1. Household ID (`HID`)**
+  
+  + High duplication: ~20 records per household on average, suggesting longitudinal or multi-member sampling.
+  
+**2. Household Relationships (`RELATE_HEAD`)**
+  
+  + Majority are neither head nor primary dependents (median=3), hinting at extended family structures.   
+
+**3. Economic Indicators (`INCOME`, `WEALTH`)**
+  
+  + **`INCOME`**: The column is constant - entirely masked (all `-1`) - required removal.  
+  
+  + **`WEALTH`**: Slight right skew (Q75=4), but few reach the highest tier (Q95+=5). 
+
+**4. Geographic/Rural Status (`RURAL`)**
+  - Only 19.5% rural.  
+  
+**5. Demographics (`AGE`, `GENDER`, `EDUC`)**
+  
+  + **`AGE`**: 8 age groups. Mean ~3.6 (median = 3), suggesting a younger population.  
+  
+  + **`GENDER`**: Near-balanced (mean = 0.496, ~49.6% female).  
+  
+  + **`EDUC`**: 5-tiered education levels. Mean ~2.96 (median = 3), indicating most have mid-level education.  
+
+**6. Household Structure (`HHTYPE`, `HHSIZE_CAT`)**
+  
+  + **`HHTYPE`**: Has complex non-ordinal categories. No conclusions based on numeric representation of groups.  
+  
+  + **`HHSIZE_CAT`**: Median = 5 out of 6 categories, mean = 4.54, suggesting larger households.  
+
+**7. Housing Quality (`FLOOR`, `WALL`, `ROOF`)**
+  
+  + **`FLOOR`**: Ordinal category of 3 types. Mean = 2.28 favoring "finished".  
+  
+  + **`WALL`**: Mean = 2.08, suggesting mixed types.  
+  
+  + **`ROOF`**: Strong skew toward category 3 (median = 3, mean = 2.96), indicating majority has "finished".  
+
+**8. Agriculture (`AGR_CONNERSHIP`)**
+  
+  + **Binary (0/1)**: 52.1% have agricultural connections (mean = 0.521), reflecting Tajikistan’s agrarian economy.  
+
+**9. Region (`REGION`)**
+  
+  + **5 regions**: Mean = 2.86 (median = 3), with values spread across categories.  
+
+```{r EDA of the population, message=FALSE}
+
+# author of the file: Alexander Rodionov
+source('C:\\Users\\SNurubloeva\\Documents\\Projects\\GLOPOP_S_tj\\functions.R')
+
+OutputEDAofDataset(df = DF, IsTrainSet = TRUE)
+
+do_MissingValue_Analysis <- 
+  (nrow(DF) !=  nrow(na.omit(DF)))
+
+```
+
+---
+
+
+## Homogeneity Test
+
+```{r Homogeneity of Subsets Test, echo=FALSE}
+
+hist(DF$WEALTH, main = 'Wealth Distribution on the Population')
+hist(DF[train, 'WEALTH'], main = 'Wealth distribution on the Train Set')
+hist(DF[test, 'WEALTH'], main = 'Wealth ditribution on the Test set')
+
+hist(DF$WEALTH[DF$REGION == 1], main = 'Wealth Distribution on the Population across the First Region')
+hist(DF[train, 'WEALTH'][DF[train, 'REGION'] == 1], main = 'Wealth Distribution on Train Set across the First Region')
+hist(DF[test, 'WEALTH'][DF[test, 'REGION'] == 1], main = 'Wealth Distribution on Test Set across the First Region')
+
+hist(DF$WEALTH[DF$REGION == 2], main = 'Wealth Distribution on the Population across the Second Region')
+hist(DF[train, 'WEALTH'][DF[train, 'REGION'] == 2], main = 'Wealth Distribution on Train Set across the Second Region')
+hist(DF[test, 'WEALTH'][DF[test, 'REGION'] == 2], main = 'Wealth Distribution on Test Set across the Second Region')
+
+hist(DF$WEALTH[DF$REGION == 3], main = 'Wealth Distribution on the Population across the Third Region')
+hist(DF[train, 'WEALTH'][DF[train, 'REGION'] == 3], main = 'Wealth Distribution on Train Set across the Third Region')
+hist(DF[test, 'WEALTH'][DF[test, 'REGION'] == 3], main = 'Wealth Distribution on Test Set across the Third Region')
+
+hist(DF$WEALTH[DF$REGION == 4], main = 'Wealth Distribution on the Population across the Fourth Region')
+hist(DF[train, 'WEALTH'][DF[train, 'REGION'] == 4], main = 'Wealth Distribution on Train Set across the Fourth Region')
+hist(DF[test, 'WEALTH'][DF[test, 'REGION'] == 4], main = 'Wealth Distribution on Test Set across the Fourth Region')
+
+hist(DF$WEALTH[DF$REGION == 5], main = 'Wealth Distribution on the Population across the Fifth Region')
+hist(DF[train, 'WEALTH'][DF[train, 'REGION'] == 5], main = 'Wealth Distribution on Train Set across the Fifth Region')
+hist(DF[test, 'WEALTH'][DF[test, 'REGION'] == 5], main = 'Wealth Distribution on Test Set across the Fifth Region')
+
+# plot(x = DF$REGION, y = DF$WEALTH)
+
+```
+
+___Conclusion___:
+Population wealth is homogeneous across the country and nearly homogeneous across the second, third and fourth regions. It is left-skewed and right-skewed in the first and fifth regions accordingly. The same picture can be observed across Train and Test samples suggesting appropriate data split.
+
+```{r Modify Columns, include=FALSE}
+
+  if(params$change_group_names==FALSE){
+    ordinals <- c('WEALTH', 'AGE', 'EDUC', 'HHSIZE_CAT')
+  
+    for(i in 1:length(DF)){
+      ifelse( names(DF[i]) %in% ordinals, DF[[i]] <- factor(DF[[i]], ordered=TRUE), DF[[i]] <- factor(DF[[i]]))
+      }
+    
+     } else{
+      
+     DF <- DF %>%
+        mutate(
+  
+      # Wealth (ordinal)
+      WEALTH = factor(WEALTH,
+                     levels = c(1, 2, 3, 4, 5),
+                     labels = c( "poorest 20%", "poorer 20%" , "middle 20%", "richer 20%", "richest 20%"),
+                     ordered = TRUE),
+  
+      # Rural/Urban
+      RURAL = factor(RURAL,
+                     levels = c(0, 1),
+                     labels = c("urban", "rural")),
+  
+      # Age categories (ordinal)
+      AGE = factor(AGE,
+                   levels = 1:8,
+                   labels = c("0-4", "5-14", "15-24", "25-34", "35-44",
+                              "45-54", "55-64", "65+"),
+                   ordered = TRUE),
+  
+      # Gender
+      GENDER = factor(GENDER,
+                      levels = c(0, 1),
+                      labels = c("female", "male")),
+  
+      # Education (ordinal)
+      EDUC = factor(EDUC,
+                    levels = 1:5,
+                    labels = c("less than primary", "complete primary",
+                              "incomplete secondary", "complete secondary or tertiary",
+                              "higher"),
+                    ordered = TRUE),
+  
+      # Household type
+      HHTYPE = factor(HHTYPE,
+                      levels = 1:8,
+                      labels = c("single", "couple", "couple with children",
+                                "one parent with children", "couple with (non-) relatives",
+                                "couple with children and (non-) relatives",
+                                "one parent with children and (non-) relatives",
+                                "other")),
+  
+      # Household size category (ordinal)
+      HHSIZE_CAT = factor(HHSIZE_CAT,
+                          levels = 1:6,
+                          labels = c("1", "2", "3-4", "5-6", "7-10", "10+"),
+                          ordered = TRUE),
+  
+      # Agricultural ownership
+      AGRI_OWNERSHIP = factor(AGRI_OWNERSHIP,
+                              levels = c(1, 0),
+                              labels = c("yes", "no")),
+  
+      # Floor material (ordinal)
+      FLOOR = factor(FLOOR,
+                     levels = c(1, 2, 3),
+                     labels = c("natural", "rudimentary", "finished"),
+                     ordered = TRUE),
+  
+      # Wall material (ordinal)
+      WALL = factor(WALL,
+                    levels = c(1, 2, 3),
+                    labels = c("natural", "rudimentary", "finished"),
+                    ordered = TRUE),
+  
+      # Roof material (ordinal)
+      ROOF = factor(ROOF,
+                    levels = c(1, 2, 3),
+                    labels = c("natural", "rudimentary", "finished"),
+                    ordered = TRUE)) }
+
+
+DF <- DF[ , !(names(DF) %in% c("SOURCE", "RURAL", "HID", "RELATE_HEAD", "INCOME"))]
+
+
+```
+
+## Relationships between WEALTH and other variables
+
+```{r Relationships between WEALTH and other Variables, echo=FALSE}
+
+p1 <- ggplot(DF, aes(x = HHSIZE_CAT, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p2 <- ggplot(DF, aes(x = FLOOR, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p3 <- ggplot(DF, aes(x = AGRI_OWNERSHIP, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p4 <- ggplot(DF, aes(x = WALL, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p5 <- ggplot(DF, aes(x = HHTYPE, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p6 <- ggplot(DF, aes(x = AGE, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p7 <- ggplot(DF, aes(x = REGION, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p8 <- ggplot(DF, aes(x = EDUC, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p9 <- ggplot(DF, aes(x = GENDER, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p10 <- ggplot(DF, aes(x = ROOF, fill = WEALTH)) +
+  geom_bar(position = "fill") +
+  labs(y = "Wealth Proportion", title = "Relationship Between Two Categorical Variables")
+
+p1 |> print()
+p2 |> print()
+p3 |> print()
+p4 |> print()
+p5 |> print()
+p6 |> print()
+p7 |> print()
+p8 |> print()
+p9 |> print()
+p10 |> print()
+
+
+```
+
+```{r Define Target Variable, include=FALSE}
+
+Y_train <- as.integer(DF[train, ]$WEALTH) - 1
+Y_test <- as.integer(DF[test, ]$WEALTH) - 1
+features <- c("AGE", "GENDER", "EDUC", "HHTYPE", "HHSIZE_CAT", 
+              "AGRI_OWNERSHIP", "FLOOR", "WALL", "ROOF", "REGION")
+
+```
+
+
+# Ordinal Logistic Regression Model
+
+__Set `params$modelType = 0`__
+
+## Model Assumptions  
+
+1. **Proportional odds**: The relationship between each predictor and the outcome is consistent across all outcome thresholds.
+
+2. **No multicollinearity**: Check VIF (<5).  
+
+3. **Adequate sample size**: ~10-20 cases per predictor per outcome level.
+
+4. **Meaningful ordinal outcome**: Categories must follow a logical order.
+
+
+## Mutial Information
+```{r Mutual Information, echo=FALSE}
+
+weights <- FSelector::information.gain(WEALTH ~ ., data = DF[1:1000000, ]) |> arrange(desc("mi_score"))
+weights 
+
+```
+
+## Correlation Matrix
+```{r Correlation Matrix, echo=FALSE, warning=FALSE}
+
+polycor_matrix <- polycor::hetcor(DF[, features],
+                        use = "complete.obs")$correlations
+
+cor_df <- as.data.frame(polycor_matrix)
+
+as.data.frame(cor_df) |> 
+  gt() |> 
+  data_color(
+    columns = everything(),
+    colors = scales::col_numeric(
+      palette = c("blue", "white", "red"),
+      domain = c(-1, 1)
+    )
+  ) |> 
+  fmt_number(decimals = 2)
+
+```
+
+___Conclusion___: Based on the Mutual Information table and Correlation matrix the following features can be removed: `AGE` and `HHTYPE`.
+
+---
+
+<!-- ## MASS::polr (Proportional Odds Logistic Regression) -->
+<!-- A classical statistical model for ordinal outcomes that assumes proportional odds - the effect of predictors is consistent across all outcome thresholds. It provides interpretable coefficients but requires strict assumptions about data structure and linearity. -->
+
+<!-- ```{r MODEL: Ordinal Logistic Regression, eval=ifelse( params$modelType == 0, TRUE, FALSE )} -->
+
+<!-- for(i in 1:length(DF)){ -->
+<!--   DF[[i]] <- factor(DF[[i]]) -->
+<!-- } -->
+
+<!-- model <- MASS::polr( formula = WEALTH ~ EDUC + HHSIZE_CAT + WALL + ROOF + FLOOR + AGRI_OWNERSHIP , data = DF[train, c(features, "WEALTH")])  # + HHTYPE + AGE -->
+
+<!-- model -->
+
+<!-- ``` -->
+
+<!-- ## Check the proportionality of Odds Assumtion -->
+<!-- ```{r Proportionality of Odds, eval=ifelse( params$modelType == 0, TRUE, FALSE ), warning=FALSE} -->
+
+<!-- brant::brant(model) -->
+
+<!-- ``` -->
+
+<!-- ## Check No Multicollinearity Assumption -->
+<!-- ```{r Multicollinearity by VIF, eval=ifelse( params$modelType == 0, TRUE, FALSE ), echo=FALSE, warning=FALSE} -->
+
+<!-- # Get VIF results properly -->
+<!-- vif_results <- vif(model)  -->
+
+
+<!-- vif_df <- as.data.frame(vif_results) %>% -->
+<!--   tibble::rownames_to_column("Variable") %>% -->
+<!--   arrange(desc(GVIF))  # Sort by GVIF -->
+
+<!-- # View results -->
+<!-- print(vif_df) -->
+
+
+<!-- ``` -->
+
+<!-- ```{r Entropy Based Feature Selection, eval=FALSE, include=FALSE} -->
+
+<!-- source('C:\\Users\\SNurubloeva\\Documents\\Projects\\GLOPOP_S_tj\\functions.R') -->
+
+<!-- # features <- c("AGE", "EDUC", "HHSIZE_CAT", "ROOF") -->
+<!-- df <- OutpuEntropyBasedFeatureSelection( df = DF[train, c(features, "WEALTH")], -->
+<!--                                          target_col = "WEALTH") -->
+
+<!-- df -->
+
+<!-- ``` -->
+
+<!-- ```{r Define Ordinal Logistic Regression Evaluation Variables, eval= ifelse(params$modelType == 0, TRUE, FALSE), include=FALSE} -->
+
+<!-- # TRAIN -->
+<!-- train_probs <- predict(model, X = as.matrix(DF[1:1000000, features]), type = 'probs') |> as.data.frame() -->
+<!-- names(train_probs) <- c("1", "2", "3", "4", "5") -->
+<!-- Y_train <- DF[1:1000000, ][, "WEALTH"] -->
+
+<!-- # TEST -->
+<!-- upper_limit <- range(train)[2] + 999999 -->
+<!-- probs <- predict(model, X = as.matrix(DF[(range(train)[2]:upper_limit), ]), type = "probs") |> as.data.frame() -->
+<!-- names(probs) <- c("1", "2", "3", "4", "5") -->
+<!-- Y_test <- DF[(range(train)[2]:upper_limit), "WEALTH"] -->
+
+<!-- ``` -->
+
+
+  
+# Light GBM (Light Gradient Boosting Machine) 
+
+__Set `params$modelType = 1`__
+
+A high-performance gradient boosting framework optimized for speed and efficiency, using histogram-based algorithms and leaf-wise growth. Excels with large datasets, handling non-linear relationships automatically while offering GPU support and categorical feature handling. Requires careful tuning but delivers strong predictive accuracy with computational efficiency.
+
+## Model Assumptions
+
+1. **No strict linearity assumption**: Handles non-linear relationships.  
+2. **Preprocess categoricals**: Use `categorical_feature` or one-hot encoding.  
+3. **Hyperparameter tuning**: Critical for performance (e.g., `num_leaves`, `learning_rate`).  
+4. **Robust to outliers**: But extreme values may affect splits.  
+
+## Hyperparameter Tuning by Random Search
+```{r LightGBM Hyperparameter Tuning by Random Search, eval = ifelse(params$modelType == 1, TRUE, FALSE), comment=''}
+
+if(params$hyperparams_tuning){
+  dtrain <- lightgbm::lgb.Dataset(
+    data = as.matrix(DF[ train , features]), 
+    label = Y_train,
+    categorical_feature = features
+  )
+  
+  # Define parameter search space
+  param_grid <- list(
+    num_leaves = sample(10:73, 20, replace = TRUE),
+    learning_rate = runif(20, 0.05, 0.2),
+    feature_fraction = runif(20, 0.5, 1.0),
+    min_data_in_leaf = sample(3:150, 20, replace = TRUE),
+    lambda_l1 = runif(20, 0, 3),
+    lambda_l2 = runif(20, 0, 3),
+    max_depth = sample(3:12, 20, replace = TRUE),
+    min_gain_to_split = runif(20, 0, 0.1),
+    bagging_fraction = runif(20, 0.6, 1.0),
+    bagging_freq = sample(1:10, 20, replace = TRUE)
+  )
+    
+  # Add fixed parameters
+  fixed_params <- list(
+    objective = "multiclass",
+    metric = "multi_logloss",
+    num_class = length(unique(Y_train)),
+      min_split_gain = 0.01,
+    feature_pre_filter = FALSE, # Critical for dynamic min_data_in_leaf
+    verbose = 1
+  )
+    
+  # Function to evaluate parameters
+  evaluate_params <- function(parameters) {
+    all_params <- c(parameters, fixed_params) 
+    
+    # Cross-validation
+    cv_result <- lightgbm::lgb.cv(
+      params = all_params,
+      data = dtrain,
+      nrounds = 300,
+      nfold = 5,
+      early_stopping_rounds = 10,
+      eval_freq = 10
+    )
+    
+    # Return best score
+    return(cv_result$best_score)
+  }
+  
+  # Run random search
+  results <- list()
+  for (i in 1:20) {
+    cat("Testing parameter set", i, "of 20\n")
+    current_params <- lapply(param_grid, function(x) x[i])
+    score <- evaluate_params(current_params)
+    results[[i]] <- c(current_params, list(score = score))
+  }
+  
+  # Find best parameters
+    scores <- sapply(results, function(x) x$score)
+    best_idx <- which.min(scores)
+    best_params <- results[[best_idx]]
+  
+  # Remove score from best parameters
+  best_params$score <- NULL
+  
+  # Combine with fixed parameters
+  lgb_params <- c(best_params, fixed_params) } else { 
+  
+  #   lgb_params <- list(
+  #   objective = "multiclass",
+  #   metric = "multi_logloss",
+  #   num_class = 5,
+  #   num_leaves = 65,
+  #   min_data_in_leaf = 63,
+  #   learning_rate = 0.1009604,
+  #   feature_fraction = 0.9170543,
+  #   min_split_gain = 0.01,
+  #   feature_pre_filter = FALSE,
+  #   lambda_l1 = 0.1002181,
+  #   lambda_l2 = 0.2050984,
+  #   verbose = 1
+  # )
+    
+    
+  lgb_params <- list(
+    num_leaves = 73,
+    learning_rate = 0.1603422,
+    feature_fraction = 0.8519221,
+    min_data_in_leaf = 20,
+    lambda_l1 = 2.903614,
+    lambda_l2 = 1.354935,
+    max_depth = 12,
+    min_gain_to_split = 0.005324554,
+    bagging_fraction = 0.97738,
+    bagging_freq = 3,
+    objective = "multiclass",
+    metric = "multi_logloss",
+    num_class = 5,
+    min_split_gain = 0.01,
+    feature_pre_filter = FALSE,
+    verbose = 1
+  )
+  
+  }
+
+
+```
+
+```{r MODEL: Light GBM, eval = ifelse( params$modelType == 1, TRUE, FALSE )}
+
+# Y_train <- as.integer(Y_train) - 1
+# Y_test <- as.integer(Y_test) - 1
+
+
+lgbm_train <- lightgbm::lgb.Dataset(data = as.matrix(DF[ train , features]), categorical_feature = features, label = Y_train)
+lgbm_holdout <- lightgbm::lgb.Dataset(data = as.matrix(DF[ test , features]), categorical_feature = features, label = Y_test)
+
+model <- lightgbm::lgb.train(params = lgb_params
+                             # , force_col_wise = TRUE # If memory is not enough
+                             # , max_bin = 255L
+                             , data = lgbm_train
+                             , valids = list(valid = lgbm_holdout) # decreases kappa and decreases overfiting
+                             , early_stopping_rounds = 10
+                             , eval_freq = 10 # 20
+                             # , nrounds = 500 # 1000
+                             )
+# summary(model)
+
+```
+
+## Get Feature Importance
+```{r Feature Importance, eval = ifelse( params$modelType == 1, TRUE, FALSE ), echo=FALSE}
+
+lightgbm::lgb.importance(model, percentage = TRUE) %>% 
+  lightgbm::lgb.plot.importance(top_n = 10, measure = "Gain")
+
+```
+
+## Feature Interaction Table 
+```{r Feature Interaction Table, eval = ifelse( params$modelType == 1, TRUE, FALSE ), echo=FALSE}
+
+sm <- as.matrix(DF[test, ])
+# sm <- as.matrix(DF1[split$test_index, feature_names[1:Max_Vars]])
+
+inter <- EIX::interactions(model, sm, option = 'interactions')
+
+inter
+
+```
+
+```{r Define LightGBM Evaluation Parameters, eval= ifelse(params$modelType == 1, TRUE, FALSE), include=FALSE}
+
+# TRAIN SET
+train_probs <- predict(model, as.matrix(DF[train, features]))
+colnames(train_probs) <- c("0", "1", "2", "3", "4")
+train_Y_test <- as.integer(DF[train, ]$WEALTH) - 1 
+  
+# TEST SET
+probs <- predict(model, as.matrix(DF[test, ][, features]))
+colnames(probs) <- c("0", "1", "2", "3", "4")
+Y_test <- as.integer(DF[test, ]$WEALTH) - 1 
+
+```
+
+```{r Light GBM Validation on i^th region, eval= FALSE}
+# load and process data
+
+i=5
+filename <- paste0('C:\\Users\\SNurubloeva\\Documents\\Projects\\GLOPOP_S_tj\\synthpop_', gdlcodes[i], '.dat.gz')
+l = individuals_per_region[individuals_per_region$GDLcode == gdlcodes[i],]$Nr_individuals
+
+con <- gzcon(file(filename, "rb"))
+
+valid = readBin(con, integer(), n = l*n_columns)
+
+close(con)
+
+valid <- array(valid, dim=c(l, n_columns))
+valid <- as.data.frame(valid)
+valid$REGION <- i
+
+colnames(valid) <- c('HID', 'RELATE_HEAD', 'INCOME', 'WEALTH', 'RURAL', 'AGE', 'GENDER',
+                         'EDUC', 'HHTYPE', 'HHSIZE_CAT','AGRI_OWNERSHIP', 'FLOOR', 'WALL', 'ROOF', 'SOURCE', 'REGION')
+
+ordinals <- c('WEALTH', 'AGE', 'EDUC', 'HHSIZE_CAT')
+
+for(i in 1:15){
+  ifelse( names(valid[i]) %in% ordinals, valid[[i]] <- factor(valid[[i]], ordered=TRUE), valid[[i]] <- factor(valid[[i]]))
+  }
+valid <- valid[ , !(names(valid) %in% c("SOURCE", "RURAL", "HID", "RELATE_HEAD", "INCOME"))]
+
+# evaluate
+
+valid_probs <- predict(model, as.matrix(valid[ , features]))
+
+colnames(valid_probs) <- c("0", "1", "2", "3", "4")
+
+valid_Y_test <- as.integer(valid[, ]$WEALTH) - 1 
+
+roc <- pROC::multiclass.roc(valid_Y_test, valid_probs)
+
+print(roc$auc)
+
+auc <- roc$auc[1]
+
+gini <- auc*2 - 1
+cat(paste("Gini on valid set:", gini), '\n')
+
+```
+
+
+  
+<!-- 
+# CatBoost Model
+
+__Set `params$modelType = 2`__
+
+An advanced gradient boosting implementation featuring native handling of categorical variables through ordered boosting and innovative approaches to missing data. Particularly robust for heterogeneous datasets. Shows high quality results in a moderate speed while not requiring preprocessing of categorical variables
+
+## Model Assumptions
+
+1. **Handles categoricals natively**: No need for one-hot encoding.  
+2. **Requires GPU for large data**: Optimal performance with GPU acceleration.  
+3. **Hyperparameter sensitivity**: Tune `depth`, `iterations`, and `learning_rate`.  
+4. **Automatic handling of missing values**: But imputation may still help.
+
+```{r Catboost Hyperparameters, eval=ifelse(params$modelType == 2, TRUE, FALSE)}
+
+if(params$hyperparams_tuning){
+  
+  next
+  
+} else {
+  
+  cat_params <- list(
+  loss_function = "MultiClass", 
+  iterations = 1000,           
+  depth = 6,                   
+  learning_rate = 0.1,         
+  verbose = 100                
+  )
+  
+  }
+
+```
+
+```{r MODEL: Catboost, eval = ifelse(params$modelType == 2, TRUE, FALSE)}
+
+trainDF <- DF[sample(nrow(distinct(DF[train, ]))), ]   # distinct(DF[train, ])
+Y_train <- as.integer(trainDF$WEALTH)
+
+train_pool <- catboost.load_pool(data = trainDF[ , features], label = Y_train[]) #, cat_features = features
+# train_pool <- catboost.load_pool(data = DF[train, features, ], label = Y_train)
+test_pool <- catboost.load_pool(data = DF[test, features], label = Y_test) #, cat_features = features
+
+model <- catboost.train(train_pool, params = cat_params)
+
+trainDF <- NULL
+
+```
+
+## Check Features for Independence
+
+CatBoost, like most gradient boosting algorithms, does not require features to be statistically independent. It can model interactions and dependencies between features through the construction of decision trees. However, it is robust and effective even when features are independent.
+
+```{r Check for Independence, eval=ifelse(params$modelType == 2, TRUE, FALSE)}
+
+# Function to test all categorical pairs
+test_all_chi_square <- function(df){
+# cat_vars <- df %>% select(where(is.factor) |>
+#                     select(where(~ nlevels(.) > 1)))
+
+cat_vars <- purrr::keep(df, ~is.factor(.) && nlevels(.) > 1)
+
+# Get all combinations
+  var_pairs <- combn(names(cat_vars), 2, simplify = FALSE)
+  
+# Run chi-square tests
+  results <- map_dfr(var_pairs, ~ {
+    tbl <- table(cat_vars[[.x[1]]], cat_vars[[.x[2]]])
+    test <- suppressWarnings(chisq.test(tbl))
+    
+    tibble(
+      Variable1 = .x[1],
+      Variable2 = .x[2],
+      ChiSq = test$statistic,
+      df = test$parameter,
+      p_value = test$p.value,
+      Warning = ifelse(any(test$expected < 5), 
+                      "Low expected counts", 
+                      "OK")
+    )
+  })
+  
+# Sort by most significant
+  arrange(results, p_value)
+}
+
+# Usage (replace DF with your dataframe)
+chi_results <- test_all_chi_square(DF)
+print(chi_results, n = Inf)  # Show all results
+
+```
+
+From the above Chi-Square Test we can conclude that there is no significance dependence among the chosen predictors.
+
+## CatBoost Feature Importance
+
+To understand how each feature contributes to the model’s prediction let's compute Feature Importance. 
+
+To get the following table, CatBoost traverses trees, recording how much each feature contributes to prediction shifts.It averages over all trees in the ensemble. The result is a vector of importances (same length as number of features), often normalized so the sum is 100.
+
+```{r Catboost Feature Importance, eval = ifelse( params$modelType == 2, TRUE, FALSE) }
+
+  catboost.get_feature_importance(model = model, pool = train_pool, type = "FeatureImportance")
+
+```
+
+
+```{r Define CatBoost Model Evaluation Variables, eval = ifelse(params$modelType == 2, TRUE, FALSE), include=FALSE}
+
+Y_train <- as.integer(DF[train, ]$WEALTH) - 1
+train_pool <- catboost.load_pool(data = DF[train, features], label = Y_train)
+
+
+# TRAIN SET
+train_probs <- catboost.predict(model, train_pool, prediction_type = "Probability") |> as.data.frame()
+train_Y_predicted <- catboost.predict(model, train_pool, prediction_type = "Class")
+colnames(train_probs) <- c("0", "1", "2", "3", "4")
+
+# TEST SET
+probs <- catboost.predict(model, test_pool, prediction_type = "Probability") |> as.data.frame()
+Y_predicted <- catboost.predict(model, test_pool, prediction_type = "Class")
+colnames(probs) <- c("0", "1", "2", "3", "4")
+
+accuracy <- sum(Y_predicted == Y_test) / length(Y_test)
+cat(paste("Accuracy:", accuracy))
+
+```
+
+
+```{r Catboost Hyperparameter Tuning, eval = params$hyperparameter_tuning, include=FALSE} 
+
+library(ParBayesianOptimization)
+
+
+
+
+```
+
+ -->
+
+<!-- # Generalized Ordinal Logistic Regression (using VGLM) -->
+
+<!-- __Set `params$modelType = 3`__ -->
+
+<!-- A flexible framework for fitting various regression models, including extended ordinal logistic models that can relax the proportional odds assumption. This allows more flexibility and higher quality in compare to `polr`. Offers sophisticated modeling options like partial proportional odds and continuation ratio models. -->
+
+<!-- As the Thomas W. Yee suggests in his article [The VGAM Package for Categorical Data Analysis](file:///C:/Users/SNurubloeva/Downloads/v32i10.pdf), "the framework is very well suited to many ‘classical’ regression models for categorical -->
+<!-- responses". -->
+
+<!-- ## Model Assumptions -->
+
+<!-- 1. **Proportional odds**: The assumption of Ordinal Logistic Regression is relaxed on a feature if it's included in family = cumulative(parallel = FALSE ~ .) of VGLM model. -->
+<!--     - requires homogeneity of the feature groups -->
+<!--     - -->
+<!-- 2. **No multicollinearity**: Check VIF (<5). -->
+<!-- 3. **Adequate sample size**: ~10-20 cases per predictor per outcome level. -->
+<!-- 4. **Meaningful ordinal outcome**: Categories must follow a logical order. -->
+
+<!-- ```{r MODEL: Vector Generalized Linear Model, eval=ifelse(params$modelType == 3, TRUE, FALSE), include=FALSE} -->
+
+<!-- # getting rid of imbalances columns of variables HHSIZE_CAT, ROOF -->
+<!-- DF$HHSIZE_CAT <- fct_collapse(DF$HHSIZE_CAT, -->
+<!--                                     "1_2" = c("1", "2"), -->
+<!--                                     "3_4" = c("3", "4"), -->
+<!--                                     "5_6" = c("5", "6")) %>% factor(., ordered = TRUE) -->
+
+<!-- DF$ROOF <- fct_collapse(DF$ROOF, -->
+<!--                                 "1_2" = c("1", "2"), -->
+<!--                                 "3" = c("3")) %>% factor(., ordered = TRUE) -->
+
+<!-- # DF$REGION <- fct_collapse(DF$REGION -->
+<!-- #                           , "1_2" = c("1", "2") -->
+<!-- #                           , "3_4" = c("3", "4")) -->
+
+<!-- # Then use HHSIZE_CAT_RECODE in your model -->
+<!-- model <- vglm( -->
+<!--   WEALTH ~ EDUC + AGRI_OWNERSHIP + FLOOR + WALL*ROOF + REGION + HHSIZE_CAT+ EDUC*AGRI_OWNERSHIP, #+ HHSIZE_CAT -->
+<!--   family = cumulative(parallel = FALSE ~ AGRI_OWNERSHIP + FLOOR + WALL),  # TRUE ~ EDUC + ROOF + REGION + HHSIZE_CAT -->
+<!--   data = DF[1:1000000, ] -->
+<!-- ) -->
+
+<!-- features <- c("EDUC", "HHSIZE_CAT", "AGRI_OWNERSHIP", -->
+<!--               "FLOOR", "WALL", "ROOF", "REGION", "AGE") -->
+
+<!-- ``` -->
+
+
+<!-- ```{r Define Variables for Model Evaluation, eval=ifelse(params$modelType == 3, TRUE, FALSE), include=FALSE} -->
+
+<!-- # TRAIN -->
+<!-- cumul_probs <- plogis(predict(model, DF[1:100000, features])) |> as.data.frame() -->
+
+<!-- train_probs <- data.frame(matrix(nrow = nrow(cumul_probs), ncol = 0)) -->
+<!-- train_probs$P1 <- cumul_probs[, 1]  # P(Y = 1) -->
+<!-- train_probs$P2 <- cumul_probs[, 2] - cumul_probs[, 1]  # P(Y = 2) -->
+<!-- train_probs$P3 <- cumul_probs[, 3] - cumul_probs[, 2]  # P(Y = 3) -->
+<!-- train_probs$P4 <- cumul_probs[, 4] - cumul_probs[, 3]  # P(Y = 4) -->
+<!-- train_probs$P5 <- 1 - cumul_probs[, 4]           # P(Y = 5) -->
+
+<!-- Y_train <- DF[1:100000, 'WEALTH'] -->
+<!-- names(train_probs) <- levels(Y_train) -->
+
+<!-- # TEST -->
+<!-- cumul_probs <- plogis(predict(model, DF[test, features])) |> as.data.frame() -->
+
+<!-- probs <- data.frame(matrix(nrow = nrow(cumul_probs), ncol = 0)) -->
+<!-- probs$P1 <- cumul_probs[, 1]  # P(Y = 1) -->
+<!-- probs$P2 <- cumul_probs[, 2] - cumul_probs[, 1]  # P(Y = 2) -->
+<!-- probs$P3 <- cumul_probs[, 3] - cumul_probs[, 2]  # P(Y = 3) -->
+<!-- probs$P4 <- cumul_probs[, 4] - cumul_probs[, 3]  # P(Y = 4) -->
+<!-- probs$P5 <- 1 - cumul_probs[, 4]           # P(Y = 5) -->
+
+<!-- Y_test <- DF[test, 'WEALTH'] -->
+<!-- names(probs) <- levels(Y_test) -->
+
+<!-- ``` -->
+
+
+# Evaluation of a Model
+
+> CURRENTLY THE `r if(params$modelType == 0) {'Ordinal Logistic Regression'} else if(params$modelType == 1) {'Light GBM'} else if(params$modelType == 2) {'CatBoost'} else {'Generalized Linear (Logistic)'}` MODEL IS BUILT. To change the model refer to the top of the page and change the parameter of the model type accordingly.
+
+<!-- ## Odds Ratio Plot -->
+
+```{r Odds Ratio Plot, eval=FALSE, include=FALSE}
+
+library(ggplot2)
+
+# Extract coefficients and confidence intervals from vglm
+coefs <- coef(model)
+confints <- confint(model, level = 0.85)
+
+# Create a data frame for plotting
+df_plot <- data.frame(
+  Variable = names(coefs),
+  OR = exp(coefs),
+  Lower = exp(confints[, 1]),
+  Upper = exp(confints[, 2]),
+  Significant = ifelse(confints[, 1] > 0 | confints[, 2] < 0, "Significant", "Not significant")
+)
+
+# Manually plot odds ratios
+ggplot(df_plot, aes(x = Variable, y = OR, color = Significant)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("Significant" = "#44bd32", "Not significant" = "orangered")) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Odds Ratios (VGAM Model)", y = "Odds Ratio", x = "Predictor")
+
+```
+
+---
+
+```{r Gini Coefficient on TRAIN set} 
+# , eval = ifelse(params$modelType == 2, TRUE, FALSE)
+
+roc <- pROC::multiclass.roc(Y_train, train_probs)
+
+print(roc$auc)
+
+auc <- roc$auc[1]
+
+gini <- auc*2 - 1
+cat(paste("Gini on train set:", gini), '\n')
+       
+```
+
+```{r Model Efficiency Metrics on TEST subset}
+
+# if(params$modelType == 0){
+#   
+#   Y_predicted <- as.numeric(probs) - 1
+# 
+# } 
+
+if(params$modelType == 1){Y_predicted <- max.col(probs) -1}  # if (eval=ifelse(params$modelType == 3, TRUE, FALSE))
+
+if(params$modelType == 3 | params$modelType == 0 ){Y_predicted <- max.col(probs)}
+
+# CONFUSION MATRIX
+print(paste0("Confusion Matrix"))
+
+if( params$modelType==0){
+  conf_table <- table(Predicted = factor(Y_predicted, ordered = TRUE, levels = c(0, 1, 2, 3, 4)), Actual = Y_test)
+} else{conf_table <- table(Predicted = Y_predicted, Actual = Y_test)}
+conf_table
+
+
+# MEAN SQUARE ERROR
+mse <- mean((Y_test - Y_predicted)^2)
+paste0('Mean Square ERROR ', mse)
+
+# MEAN ABSOLUTE ERROR
+mae <- mean(abs(Y_predicted - Y_test))
+paste0('Mean Absolute ERROR ', mae)
+
+# WEIGHTERD MEAN ABSOLUTE ERROR
+
+n_classes <- length(unique(DF[train, ]$WEALTH))
+weight_matrix <- outer(0:(n_classes-1), 0:(n_classes-1), FUN = function(x,y) abs(x-y))
+
+if(params$modelType == 3){
+    weighted_mae <- mean(weight_matrix[cbind(Y_test, Y_predicted)])
+
+  } else{weighted_mae <- mean(weight_matrix[cbind(Y_test+1, Y_predicted+1)])}
+paste0('Weighted Mean Absolute ERROR ', weighted_mae)
+
+# ORDINAL CONCORDANCE
+orc <- DescTools::GoodmanKruskalGamma(Y_predicted, Y_test)
+paste0("Ordinal Concordance ", orc)
+
+
+accuracy <- sum(diag(conf_table))/sum(conf_table)
+paste0('Accuracy ', accuracy)
+
+precision <- conf_table[2,2]/sum(conf_table[,2])
+paste0('Precision ', precision)
+
+recall <- conf_table[2,2]/sum(conf_table[2,])
+paste0('Recall / Sensitivity  ', recall)
+
+f1_score <- 2 * (precision * recall) / (precision + recall)
+paste0('F1 Score ', f1_score)
+
+
+```
+
+```{r KAPPA Metric on TEST subset}
+
+if( params$modelType == 0){ Y_predicted <- factor(Y_predicted, ordered = TRUE, levels = c(0, 1, 2, 3, 4) ) 
+
+#COHEN's KAPPA
+kappa <- caret::confusionMatrix(Y_predicted, factor(Y_test))$overall["Kappa"]
+} else{ kappa <- caret::confusionMatrix(factor(Y_predicted), factor(Y_test))$overall["Kappa"] }
+cat(paste("Cohen's Kappa:", kappa, ''))
+
+# WEIGHTED KAPPA
+kappa_stats <- vcd::Kappa(as.table(conf_table))
+cat("\nKappa Statistics", '')
+kappa_stats
+
+weighted_kappa <- kappa_stats$Weighted[1]
+
+cat("\nKappa Confidence Interval", '')
+confint(kappa_stats)
+
+```
+
+```{r Gini Coefficient on TEST set}
+
+
+roc <- pROC::multiclass.roc(Y_test, probs)
+
+print(roc$auc)
+auc <- roc$auc[1]
+
+gini <- auc*2 - 1
+cat(paste("Gini on test set:", gini), '\n')
+
+```
+
+```{r Ranked Probability Score on Test Set, eval = FALSE, include=FALSE}
+
+# Function to calculate Ranked Probability Score (RPS)
+ranked_probability_score <- function(true_class, predicted_probs) {
+  K <- ncol(predicted_probs)  # Number of classes
+  rps <- numeric(length = nrow(predicted_probs))
+  
+  for (i in 1:nrow(predicted_probs)) {
+    o <- as.numeric(1:K == true_class[i])  # True class as one-hot
+    p_cumsum <- cumsum(predicted_probs[i, ])
+    o_cumsum <- cumsum(o)
+    rps[i] <- sum((p_cumsum - o_cumsum)^2) / (K - 1)
+  }
+  
+  return(mean(rps))  # Average RPS across all samples
+}
+
+ranked_probability_score(Y_test, probs)
+
+
+```
+
+
+
+# Conclusions on the model
+
+___Gini___: Measures inequality among class probabilities, used in high-rist environment or imbalanced data, aka measures predictions accuracy at the extremes.
+
+___Weighted Kappa___: Kappa focuses on exact class matching, penalizing misclassification imbalances, making it highly important for ordinal evaluation.
+
+___Weighted MAE___: Adjusts MAE by ordinal distance, making it highly relevant for ordinal problems. General: An improved version of MAE that explicitly accounts for the severity of misclassifications in ordered classes.
+
+___ORC (Ordinal Concordance)___: Directly measures how well predicted probabilities align with the true ordinal class structure. Specifically designed for ordinal models, it evaluates whether predictions generally follow the true class hierarchy.
+
+___Accuracy___: Simple proportion of correct predictions, works best when data is balanced but may fail in uneven data or ordered classes.
+
+___Precision___: Measures correct positive predictions per class. Focuses on the reliability of positive predictions but treats all misclassifications equally, regardless of order.
+
+___Recall___: Tracks how well each class is captured but does not differentiate between near and far misclassifications. 
+
+___F1 Score___: Harmonic mean of precision and recall, useful for per-class balance but less ideal for ordinal evaluation. General: Combines precision and recall for a single score but is best suited for nominal rather than ordinal classification.
+
+___MSE___: Penalizes larger errors (useful for ordinality if classes are numeric), but assumes interval scaling, which may not apply. General: A regression metric that can be adapted for ordinal problems if classes are treated as continuous values.
+
+___MAE___: Average absolute error, respects ordinality if classes are numeric, but less interpretable for non-interval data. General: A straightforward error metric that works if class distances are meaningful but may not align with ordinal logic.
+
+
+```{r model-metrics, echo=FALSE, message=FALSE}
+
+metrics <- tibble(
+  Metric = c("Gini", "Weighted Kappa", "Weighted MAE", "ORC", "Accuracy", "Precision", 
+             "Recall", "F1 Score", "MSE", "MAE"),
+  Value = c(gini, weighted_kappa, weighted_mae, orc, accuracy, precision, recall, f1_score, mse, mae)
+) %>%
+  mutate(
+    Interpretation = case_when(
+      Metric == "Gini" ~ case_when(
+        Value >= 0.7 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥0.7: Strong discrimination)</span>",
+        Value >= 0.5 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (0.5-0.7: Moderate)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<0.5: Weak)</span>"
+      ),
+      Metric == "Weighted Kappa" ~ case_when(
+        Value >= 0.6 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥0.6: Substantial agreement)</span>",
+        Value >= 0.4 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (0.4-0.6: Moderate)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<0.4: Slight)</span>"
+      ),
+      Metric == "Weighted MAE" ~ case_when(
+        Value <= 0.3 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≤0.3)</span>",
+        Value <= 0.5 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (0.31-0.5)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (>0.5)</span>"
+      ),
+      Metric == "ORC" ~ case_when(
+        Value >= 0.85 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥85%)</span>",
+        Value >= 0.6 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (70-84%)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<70%)</span>"
+      ),
+      
+      Metric == "Accuracy" ~ case_when(
+        Value >= 0.8 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥80%)</span>",
+        Value >= 0.7 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (70-79%)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<70%)</span>"
+      ),
+      Metric == "Precision" ~ case_when(
+        Value >= 0.75 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥75%)</span>",
+        Value >= 0.6 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (60-74%)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<60%)</span>"
+      ),
+      Metric == "Recall" ~ case_when(
+        Value >= 0.8 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥80%)</span>",
+        Value >= 0.6 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (60-79%)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<60%)</span>"
+      ),
+      Metric == "F1 Score" ~ case_when(
+        Value >= 0.75 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≥0.75)</span>",
+        Value >= 0.6 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (0.6-0.74)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (<0.6)</span>"
+      ),
+      Metric == "MSE" ~ case_when(
+        Value <= 1.0 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≤1.0)</span>",
+        Value <= 2.0 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (1.1-2.0)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (>2.0)</span>"
+      ),
+      Metric == "MAE" ~ case_when(
+        Value <= 0.3 ~ "<span style='color:#00aa00;font-weight:bold'>Excellent (≤0.3)</span>",
+        Value <= 0.5 ~ "<span style='color:#ffcc00;font-weight:bold'>Fair (0.31-0.5)</span>",
+        TRUE ~ "<span style='color:#ff0000;font-weight:bold'>Poor (>0.5)</span>"
+      )
+    )
+  )
+
+metrics %>%
+  gt() %>%
+  tab_header(
+    title = md("**Model Performance Metrics**"),
+    subtitle = "Test Set Evaluation Results"
+  ) %>%
+  fmt_number(
+    columns = Value,
+    decimals = 3
+  ) %>%
+  cols_align(
+    align = "left",
+    columns = Interpretation
+  ) %>%
+  # data_color(
+    # columns = Value
+    # , colors = scales::col_numeric(
+      # palette = c("red", "yellow", "green"),
+      # domain = c(0, 1)
+    # ) )
+   # %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_options(
+    table.font.size = "14px",
+    column_labels.font.weight = "bold"
+  ) %>%
+  fmt_markdown(columns = Interpretation)  # This renders the HTML formatting
+
+```
+
+

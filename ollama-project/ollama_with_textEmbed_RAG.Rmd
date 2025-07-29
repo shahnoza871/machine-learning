@@ -1,0 +1,446 @@
+---
+title: "Ollama Models with text::textEmbed RAG from freeCodeCamp tutorial"
+output: html_document
+---
+
+```{r Load Packages}
+
+library(ellmer)
+library(ollamar)
+library(emend)
+library(dplyr)
+library(future)
+library(httr)
+library(jsonlite)
+library(text)
+# library(torch)
+library(reticulate)
+library(rchroma)
+library(stringr)
+library(lubridate)
+
+```
+
+```{r Data Load}
+
+DF <- read.csv('DF.csv') |> as.data.frame()
+
+DF$Date <- c( "01//2022  ", "02//2022  ", "03//2022  ", "04//2022  ", "05//2022  ", 
+              "06//2022  ", "07//2022  ", "08//2022  ", "09//2022  ", "10//2022  ", 
+              "11//2022  ", "12//2022  ", "01//2023  ", "02//2023  ", "03//2023  ", 
+              "04//2023  ", "05//2023  ", "06//2023  ", "07//2023  ", "08//2023  ", 
+              "09//2023  ", "10//2023  ", "11//2023  ", "12//2023  ", "01//2024  ", 
+              "02//2024  ", "03//2024  ", "04//2024  ", "05//2024  ", "06//2024  ", 
+              "07//2024  ", "08//2024  ", "09//2024  ", "10//2024  ", "11//2024  ", 
+              "12//2024  ", "01//2025  ", "02//2025  ", "03//2025  ", "04//2025  ", 
+              "05//2025  ", "06//2025  ")
+
+user_question <- "Опиши эти данные."
+
+```
+
+```{r Splitting to Chunks for RAG}
+
+chunk_size <- 1
+
+# n <- nrow(DF)
+# r <- rep(1:ceiling(n/chunk_size), each = chunk_size)[1:n]
+# chunks <- split(DF, r)
+
+columns <- c(
+  "bank_borrower_share_",   # Доля банка в количестве заемщиков по рынку
+  "market_borrowerCount",  # Количество заемщиков по рынку
+  "bank_loan_share_____",   # Доля банка в сумме выданных кредитов по рынку
+  "market_loan_amount__",   # Сумма выданных кредитов по рынку
+  "bank_avg_loan_rate__",   # Средняя номинальная ставка по кредиту в банке
+  "market_avg_loan_rate",   # Средняя номинальная ставка по кредиту в рынке
+  "bank_loan_count_____",   # Доля банка в количестве выданных кредитов по рынку
+  "market_loan_count___",   # Количество выданных кредитов по рынку
+  "date_MM//YYYY_______"     # Месяц Год
+)
+
+chunks <- c()
+
+for (i in 1:length(DF)){
+  
+  chunk <- columns[i]
+  # chunk <- ''
+  
+  for (j in 1:length(DF[[i]])){
+    
+    record <- DF[[i]][j] |> as.character() |> stringr::str_sub(1L, 8L)
+    chunk <- c(chunk, ",", record)
+  }
+  
+  if(i==2){
+    chunk <- c(chunk, "   ")
+  }
+  
+  if(i==8){
+    chunk <- c(chunk, "    ")
+  }
+  
+  chunks[i] <- chunk|> paste(collapse = "")
+  # cat(chunk, '\n', 'length:', nchar(chunk), '\n\n')
+  
+}
+
+```
+
+```{r Proper Date format, eval=FALSE}
+
+date_to_russian_short <- function(date_string) {
+  # Define Russian month abbreviations with consistent length (3 letters + dot)
+  month_abbr <- c(
+    "Янв.", "Фев.", "Мар.", "Апр.", "Май.", "Июн.",
+    "Июл.", "Авг.", "Сен.", "Окт.", "Ноя.", "Дек."
+  )
+  
+  # Parse the input date (handling both Date objects and character strings)
+  if (is.character(date_string)) {
+    parsed_date <- as.Date(date_string)
+  } else if (inherits(date_string, "Date")) {
+    parsed_date <- date_string
+  } else {
+    stop("Input must be a Date object or character string in YYYY-MM-DD format")
+  }
+  
+  # Extract year and month
+  year <- format(parsed_date, "%Y")
+  month_num <- as.integer(format(parsed_date, "%m"))
+  
+  # Get the corresponding Russian abbreviation
+  month_russian <- month_abbr[month_num]
+  
+  # Combine into final format "Мар. 2022"
+  formatted_date <- paste(month_russian, year)
+  
+  return(formatted_date)
+}
+
+```
+
+```{r Sliding Window Chunks for RAG, eval=FALSE}
+
+# DF$Date <- my(DF$Date)
+
+create_sliding_window_chunks <- function(df, window_size = 3) {
+  chunks <- list()
+  recent_cutoff <- max(df$Date) - years(1)
+
+  # Recent data (sliding step = 1)
+  recent_df <- df %>% filter(Date >= recent_cutoff)
+  for (col in colnames(recent_df)[-which(colnames(recent_df) == "Date")]) {
+    if (nrow(recent_df) >= window_size) {
+      for (i in 1:(nrow(recent_df) - window_size + 1)) {
+        chunk <- recent_df[i:(i + window_size - 1), c("Date", col)]
+        chunk$Date <- date_to_russian_short(chunk$Date)
+        chunks[[length(chunks) + 1]] <- chunk
+      }
+    }
+  }
+  
+  # Older data (sliding step = window_size)
+  older_df <- df %>% filter(Date < recent_cutoff)
+  for (col in colnames(older_df)[-which(colnames(older_df) == "Date")]) {
+    if (nrow(older_df) >= window_size) {
+      for (i in seq(1, nrow(older_df) - window_size + 1, by = window_size)) {
+        chunk <- older_df[i:(i + window_size - 1), c("Date", col)]
+        chunk$Date <- date_to_russian_short(chunk$Date) 
+        chunks[[length(chunks) + 1]] <- chunk
+      }
+    }
+  }
+  
+  return(chunks)
+}
+
+chunks <- create_sliding_window_chunks(DF)
+
+```
+
+```{r Check Lengths}
+
+for (i in 1:length(chunks)){
+    chunks[i] |> nchar() |> print()
+}
+
+```
+
+
+```{r Importing py requirements}
+# install.packages("reticulate")
+library(reticulate)
+
+py_run_string("import torch")
+print(py_run_string("print(torch.__version__)"))
+
+py_run_string("import huggingface_hub")
+print(py_run_string("print(huggingface_hub.__version__)"))
+
+py_run_string("import transformers")
+print(py_run_string("print(transformers.__version__)"))
+
+py_run_string("import nltk")
+print(py_run_string("print(nltk.__version__)"))
+
+py_run_string("import hf_xet")
+# print(py_run_string("print(hf_xet.__version__)"))
+
+```
+
+```{r Embedding, eval=FALSE}
+
+# embeddings are vector representations of words or sentences
+
+#empty dataframe
+info_row_embeddings <-  data.frame(
+  info = character(), # the actual DF row
+  info_vec_embeddings = I(list()), # row embeddings
+  info_id = character() # unique ID for each row
+)
+
+# info_row_embeddings <- tibble( # modification
+#   info = character(),
+#   info_vec_embeddings = list(),
+#   info_id = character()
+# )
+
+# create a progress bar
+pb <- txtProgressBar(min = 1, max = length(chunks), style = 3)
+
+for (i in 1:length(chunks)) {
+    info <- as.character(chunks[i])
+    # info <- as.data.frame(chunks[i])
+    # info <- chunks[i]
+    info_id <- paste0("info",i)
+  #   info_embeddings <- textEmbed(as.character(info),
+  #                               layers = 10:11,
+  #                               aggregation_from_layers_to_tokens = "concatenate", # combines embeddings from specified layers to create detailed embeddings for each token
+  #                               aggregation_from_tokens_to_texts = "mean", #  specify sentence embeddings
+  #                               keep_token_embeddings = FALSE,
+  #                               batch_size = 1
+  # )
+
+    info_embeddings <- text::textEmbed(
+      texts = info,
+      model = "bert-base-uncased",  # or another supported model
+      layers = 10:11,
+      aggregation_from_layers_to_tokens = "concatenate",
+      aggregation_from_tokens_to_texts = "mean",
+      keep_token_embeddings = FALSE  # Ensures only text-level output
+    )
+    
+  # convert tibble to vector
+    info_vec_embeddings <- unlist(info_embeddings, use.names = FALSE) 
+    
+    # # modification start
+    # 
+    # # First reshape into a matrix (tokens × dimensions)
+    # embedding_matrix <- matrix(info_vec_embeddings, 
+    #                          nrow = length(info_vec_embeddings)/768,  # Assuming BERT's 768 dim
+    #                          byrow = TRUE)
+    # 
+    # # Apply pooling across tokens
+    # pooled_embedding <- apply(embedding_matrix, 2, max)  # Max pooling
+    # # Alternative: apply(embedding_matrix, 2, mean) for mean pooling
+    # 
+    # info_vec_embeddings <- list(pooled_embedding)
+    # 
+    # # modification end
+    
+    info_vec_embeddings <- list(info_vec_embeddings)
+  
+  # Append the current chunk's data to the dataframe
+  info_row_embeddings <- info_row_embeddings %>%
+    add_row(
+      info = info,
+      info_vec_embeddings = info_vec_embeddings,
+      info_id = info_id
+    )
+  
+  
+  # track embedding progress
+  setTxtProgressBar(pb, i)
+  
+}
+  
+```
+
+```{r Save / Read Embeddings}
+
+# # saved as rds file for by sliding window method
+# saveRDS(info_embeddings, r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_embeddings_CW_SW.rds)")
+# saveRDS(info_row_embeddings, r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_row_embeddings_CW_SW.rds)")
+# saveRDS(info_vec_embeddings, r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_vec_embeddings_CW_SW.rds)")
+
+
+# # read columnwise chunks embedding by sliding window method
+# info_embeddings <- readRDS(r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_embeddings_CW_SW.rds)")
+# info_row_embeddings <- readRDS(r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_row_embeddings_CW_SW.rds)")
+# info_vec_embeddings <- readRDS(r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_vec_embeddings_CW_SW.rds)")# |> as.list()
+
+
+# read columnwise chunks embedding
+info_embeddings <- readRDS(r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_embeddings_CW_1.rds)")
+info_row_embeddings <- readRDS(r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_row_embeddings_CW_1.rds)")
+info_vec_embeddings <- readRDS(r"(C:\Users\SNurubloeva\Documents\Projects\llm financial assistant project/info_vec_embeddings_CW_1.rds)")# |> as.list()
+
+# # read row-wise chunks embedding
+# info_embeddings <- readRDS(r"(C:/Users/SNurubloeva/Documents/Projects/llm financial assistant project/info_embeddings_RW.rds)")
+# info_row_embeddings <- readRDS(r"(C:/Users/SNurubloeva/Documents/Projects/llm financial assistant project/info_row_embeddings_RW.rds)")
+# info_vec_embeddings <- readRDS(r"(C:/Users/SNurubloeva/Documents/Projects/llm financial assistant project/info_vec_embeddings_RW.rds)") # |> as.list()
+
+```
+
+```{r eval=FALSE}
+
+info_embeddings <- reticulate::py_to_r(info_embeddings)
+
+info_row_embeddings <- reticulate::py_to_r(info_row_embeddings)
+
+info_vec_embeddings <- reticulate::py_to_r(info_vec_embeddings)
+
+```
+
+```{r}
+
+embedding_lengths <- sapply(info_row_embeddings$info_vec_embeddings, length)
+table(embedding_lengths)
+
+
+```
+
+
+```{r Store embedded context in the Chroma Vector DB}
+
+library(shinychat)
+library(shiny)
+
+ui <- bslib::page_fluid(
+  chat_ui("chat")
+)
+
+
+server <- function(input, output, session) {
+
+    # reticulate::py_install("chromadb")
+
+    chroma <- import("chromadb")
+    # client <- chroma$Client()
+    client <- chroma$PersistentClient(path = "chroma_db")  # Use persistent client
+
+    
+
+# ------------------------- create collection once -------------------------------------
+    
+  # client$create_collection("financial_info_collection")
+    
+  tryCatch({
+    collection <- client$get_collection("financial_info_collection")
+  }, error = function(e) {
+    collection <- client$create_collection("financial_info_collection")
+  })
+  
+    
+#---------------------------------------------------------------------------------------
+    
+    collection <- client$get_collection("financial_info_collection")
+    
+    client$get_collection("financial_info_collection")$add(
+      documents = as.list(info_row_embeddings$info)
+      , ids = as.list(info_row_embeddings$info_id)
+      , embeddings = info_row_embeddings$info_vec_embeddings
+      )
+    
+    
+    # <!-- ``` -->
+    
+    # ```{r User Input Query Embedding Function}
+    
+    #sentence embeddings function and query
+    question <- function(sentence){
+        sentence_embeddings <- textEmbed(sentence,
+                                         layers = 10:11,
+                                         aggregation_from_layers_to_tokens = "concatenate",
+                                         aggregation_from_tokens_to_texts = "mean",
+                                         keep_token_embeddings = FALSE
+        )
+
+        cat("Sentance embedding STRUCTURE: ", str(sentence_embeddings))
+        
+        # convert tibble to vector
+        sentence_vec_embeddings <- unlist(sentence_embeddings, use.names = FALSE)
+        sentence_vec_embeddings <- list(sentence_vec_embeddings)
+    
+        cat("Sentance vector embedding STRUCTURE: ", str(sentence_vec_embeddings))
+        
+        # Query similar documents using embeddings
+        
+        # results <- query(
+        #   client,
+        #   "financial_info_collection",
+        #   query_embeddings = sentence_vec_embeddings ,
+        #   n_results = 2
+        # )
+        
+        results <- collection$query(
+          query_embeddings = sentence_vec_embeddings,
+          n_results = 2L # instead of ( 2 => 2.0 => float ) indicate ( 2L => int )
+        )
+        
+        results
+    
+      }
+    
+    # <!-- ``` -->
+    
+    # ```{r Tool Calling}
+    
+      tool_context  <- ellmer::tool(
+        question,
+        "obtains the right context for a given question",
+        sentence = type_string()
+    
+      )
+    
+    
+    # <!-- ``` -->
+    
+    # ```{r Initialize the Chat System, Design Prompts, and Integrate Tools}
+    
+    # user_question <- list(
+    #   list(role = "user", content = user_question)
+    # )
+    
+    # the_chat <- chat(messages = user_question,
+    #                       model = "llama3.1")
+    
+    # the_chat$register_tool(tool_context)
+    
+    chat_ex <- chat_ollama(system_prompt = user_question, model = "qwen3:4b")
+    
+    chat_ex$register_tool(tool_context)
+    
+    # <!-- ``` -->
+    
+    # ```{r}
+
+    observeEvent(input$chat_user_input, {
+      stream <- chat_ex$stream_async(input$chat_user_input)
+      chat_append("chat", stream)
+    })
+
+}
+
+shiny::shinyApp(ui, server)
+
+```
+
+```{r}
+
+reticulate::py_last_error()
+
+```
+
+
